@@ -10,6 +10,7 @@ and extracts attorney info from the "Copies to:" section.
 """
 import re
 import json
+import sqlite3
 import logging
 from datetime import date, timedelta
 from html.parser import HTMLParser
@@ -24,6 +25,61 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', date
 log = logging.getLogger('sc_tot_app')
 
 app = FastAPI(title="SC TO-T Attorney Lookup")
+
+# ── SQLite cache ─────────────────────────────────────────────────────
+DB_PATH = Path(__file__).parent / 'cache.db'
+
+def init_cache():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS attorney_cache (
+            adsh TEXT NOT NULL,
+            filing_date TEXT,
+            form TEXT,
+            companies TEXT,
+            attorney_names TEXT,
+            firm TEXT,
+            address TEXT,
+            phone TEXT,
+            filing_url TEXT,
+            cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(adsh, firm, attorney_names)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_date ON attorney_cache(filing_date)")
+    conn.commit()
+    conn.close()
+    log.info("Cache initialized")
+
+init_cache()
+
+def get_cached(start, end):
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM attorney_cache WHERE filing_date BETWEEN ? AND ? ORDER BY filing_date DESC",
+        (start, end)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def save_to_cache(records):
+    if not records:
+        return
+    conn = sqlite3.connect(str(DB_PATH))
+    for r in records:
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO attorney_cache
+                   (adsh, filing_date, form, companies, attorney_names, firm, address, phone, filing_url)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (r.get('adsh', ''), r['filing_date'], r['form'], r['companies'],
+                 r['attorney_names'], r['firm'], r['address'], r['phone'], r['filing_url'])
+            )
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
 
 EDGAR_SEARCH = 'https://efts.sec.gov/LATEST/search-index'
 EDGAR_BASE = 'https://www.sec.gov/Archives/edgar/data'
@@ -128,14 +184,31 @@ async def search_filings(
     start: str = Query(default=""),
     end: str = Query(default=""),
     limit: int = Query(default=100),
+    refresh: bool = Query(default=False),
 ):
-    """Search EDGAR for SC TO-T filings and extract attorney info."""
+    """Search EDGAR for SC TO-T filings and extract attorney info.
+
+    Checks SQLite cache first. Only fetches uncached filings from EDGAR.
+    Pass refresh=true to force re-scrape everything.
+    """
     if not start:
         start = (date.today() - timedelta(days=180)).isoformat()
     if not end:
         end = date.today().isoformat()
 
-    # Step 1: search EDGAR
+    # Check cache first
+    if not refresh:
+        cached = get_cached(start, end)
+        if cached:
+            # Strip internal fields
+            for r in cached:
+                r.pop('cached_at', None)
+                r.pop('adsh', None)
+            log.info(f"Cache hit: {len(cached)} records for {start} to {end}")
+            return JSONResponse(cached)
+
+    # Cache miss — search EDGAR
+    log.info(f"Cache miss — scraping EDGAR for {start} to {end}")
     params = {
         'forms': 'SC TO-T',
         'dateRange': 'custom',
@@ -152,7 +225,7 @@ async def search_filings(
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=502)
 
-    # Step 2: fetch each filing and extract attorneys
+    # Fetch each filing and extract attorneys
     results = []
     seen_adsh = set()
     for h in hits:
@@ -165,7 +238,6 @@ async def search_filings(
         file_date = s.get('file_date', '')
         form = s.get('form', '')
 
-        # Deduplicate by adsh (same filing, different amendments)
         if adsh in seen_adsh:
             continue
         seen_adsh.add(adsh)
@@ -173,7 +245,6 @@ async def search_filings(
         if not ciks or not filename:
             continue
 
-        # Try fetching HTML
         url = build_filing_url(adsh, ciks[0], filename)
         html = None
         try:
@@ -189,7 +260,6 @@ async def search_filings(
             pass
 
         attorneys = extract_copies_to(html) if html else []
-        # Clean company names (strip CIK info)
         clean_companies = []
         for c in companies:
             name = re.sub(r'\s*\(CIK\s+\d+\)', '', c).strip()
@@ -197,10 +267,10 @@ async def search_filings(
             clean_companies.append(name)
 
         for a in attorneys:
-            # Skip garbage entries (underscores, blanks)
             if not a['firm'] and (not a['attorney_names'] or '___' in a['attorney_names']):
                 continue
             results.append({
+                'adsh': adsh,
                 'filing_date': file_date,
                 'form': form,
                 'companies': ' / '.join(clean_companies),
@@ -210,6 +280,14 @@ async def search_filings(
                 'phone': a['phone'],
                 'filing_url': url,
             })
+
+    # Save to cache
+    save_to_cache(results)
+    log.info(f"Cached {len(results)} records")
+
+    # Strip internal fields for response
+    for r in results:
+        r.pop('adsh', None)
 
     return JSONResponse(results)
 
@@ -462,7 +540,8 @@ FRONTEND_HTML = """<!DOCTYPE html>
       <label>Filter</label>
       <input type="text" id="filter" placeholder="Company, attorney, or firm...">
     </div>
-    <button class="btn-primary" id="searchBtn" onclick="runSearch()">Search Filings</button>
+    <button class="btn-primary" id="searchBtn" onclick="runSearch(false)">Search Filings</button>
+    <button class="btn-secondary" id="refreshBtn" onclick="runSearch(true)" style="display:none">Re-scrape EDGAR</button>
     <button class="btn-secondary" id="exportBtn" onclick="exportCSV()" style="display:none">Export CSV</button>
   </div>
 
@@ -501,27 +580,34 @@ document.getElementById('endDate').value = today.toISOString().split('T')[0];
 // Filter listener
 document.getElementById('filter').addEventListener('input', renderTable);
 
-async function runSearch() {
+async function runSearch(refresh) {
   const btn = document.getElementById('searchBtn');
   const status = document.getElementById('status');
   const start = document.getElementById('startDate').value;
   const end = document.getElementById('endDate').value;
 
   btn.disabled = true;
-  btn.textContent = 'Searching...';
-  status.textContent = 'Querying EDGAR and extracting attorney info — this may take a minute...';
+  btn.textContent = refresh ? 'Re-scraping...' : 'Searching...';
+  status.textContent = refresh
+    ? 'Re-scraping EDGAR — this may take a minute...'
+    : 'Checking cache, then EDGAR if needed...';
 
   try {
-    const resp = await fetch(`/api/search?start=${start}&end=${end}&limit=200`);
+    const url = `/api/search?start=${start}&end=${end}&limit=200${refresh ? '&refresh=true' : ''}`;
+    const t0 = Date.now();
+    const resp = await fetch(url);
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     allData = await resp.json();
     if (allData.error) {
       status.textContent = 'Error: ' + allData.error;
       return;
     }
-    status.textContent = `Found ${allData.length} attorney records`;
+    const cached = elapsed < 2 ? ' (cached)' : '';
+    status.textContent = `Found ${allData.length} attorney records in ${elapsed}s${cached}`;
     document.getElementById('count').textContent = allData.length;
     document.getElementById('count').style.display = allData.length ? 'inline-block' : 'none';
     document.getElementById('exportBtn').style.display = allData.length ? '' : 'none';
+    document.getElementById('refreshBtn').style.display = allData.length ? '' : 'none';
     renderTable();
   } catch (e) {
     status.textContent = 'Request failed: ' + e.message;
