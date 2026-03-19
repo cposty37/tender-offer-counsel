@@ -200,14 +200,16 @@ async def search_filings(
     if not refresh:
         cached = get_cached(start, end)
         if cached:
-            # Strip internal fields
             for r in cached:
                 r.pop('cached_at', None)
                 r.pop('adsh', None)
             log.info(f"Cache hit: {len(cached)} records for {start} to {end}")
-            return JSONResponse(cached)
+            return JSONResponse({'results': cached, 'partial': False, 'processed': 0, 'total_filings': 0})
 
     # Cache miss — search EDGAR
+    import time as _time
+    deadline = _time.time() + 240  # 4 minute max to stay under Railway timeout
+
     log.info(f"Cache miss — scraping EDGAR for {start} to {end}")
     params = {
         'forms': 'SC TO-T',
@@ -215,7 +217,7 @@ async def search_filings(
         'startdt': start,
         'enddt': end,
         '_source': 'adsh,form,file_date,display_names,ciks,biz_locations',
-        'size': limit,
+        'size': 400,
     }
     try:
         r = requests.get(EDGAR_SEARCH, params=params,
@@ -225,10 +227,19 @@ async def search_filings(
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=502)
 
-    # Fetch each filing and extract attorneys
+    log.info(f"EDGAR returned {len(hits)} filings to process")
+
+    # Fetch each filing and extract attorneys (with time guard)
     results = []
     seen_adsh = set()
+    processed = 0
+    timed_out = False
     for h in hits:
+        if _time.time() > deadline:
+            log.warning(f"Time limit reached after {processed} filings — returning partial results")
+            timed_out = True
+            break
+
         s = h['_source']
         adsh = s['adsh']
         doc_id = h['_id']
@@ -245,15 +256,16 @@ async def search_filings(
         if not ciks or not filename:
             continue
 
+        processed += 1
         url = build_filing_url(adsh, ciks[0], filename)
         html = None
         try:
-            resp = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=20)
+            resp = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=10)
             if resp.status_code == 200:
                 html = resp.text
             elif len(ciks) > 1:
                 url = build_filing_url(adsh, ciks[1], filename)
-                resp = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=20)
+                resp = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=10)
                 if resp.status_code == 200:
                     html = resp.text
         except Exception:
@@ -281,6 +293,8 @@ async def search_filings(
                 'filing_url': url,
             })
 
+    log.info(f"Processed {processed} filings, extracted {len(results)} attorney records")
+
     # Save to cache
     save_to_cache(results)
     log.info(f"Cached {len(results)} records")
@@ -289,7 +303,8 @@ async def search_filings(
     for r in results:
         r.pop('adsh', None)
 
-    return JSONResponse(results)
+    resp_data = {'results': results, 'partial': timed_out, 'processed': processed, 'total_filings': len(hits)}
+    return JSONResponse(resp_data)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -597,13 +612,15 @@ async function runSearch(refresh) {
     const t0 = Date.now();
     const resp = await fetch(url);
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    allData = await resp.json();
-    if (allData.error) {
-      status.textContent = 'Error: ' + allData.error;
+    const body = await resp.json();
+    if (body.error) {
+      status.textContent = 'Error: ' + body.error;
       return;
     }
-    const cached = elapsed < 2 ? ' (cached)' : '';
-    status.textContent = `Found ${allData.length} attorney records in ${elapsed}s${cached}`;
+    allData = body.results || body;
+    const fromCache = elapsed < 2 ? ' (cached)' : '';
+    const partial = body.partial ? ` — processed ${body.processed} of ${body.total_filings} filings (use a shorter date range for complete results)` : '';
+    status.textContent = `Found ${allData.length} attorney records in ${elapsed}s${fromCache}${partial}`;
     document.getElementById('count').textContent = allData.length;
     document.getElementById('count').style.display = allData.length ? 'inline-block' : 'none';
     document.getElementById('exportBtn').style.display = allData.length ? '' : 'none';
