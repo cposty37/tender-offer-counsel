@@ -47,6 +47,13 @@ def init_cache():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_date ON attorney_cache(filing_date)")
+    # Track which filings have been processed (even if no attorney found)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS processed_filings (
+            adsh TEXT PRIMARY KEY,
+            checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
     log.info("Cache initialized")
@@ -78,6 +85,15 @@ def save_to_cache(records):
             )
         except Exception:
             pass
+    conn.commit()
+    conn.close()
+
+def mark_processed(adsh_list):
+    if not adsh_list:
+        return
+    conn = sqlite3.connect(str(DB_PATH))
+    for adsh in adsh_list:
+        conn.execute("INSERT OR IGNORE INTO processed_filings (adsh) VALUES (?)", (adsh,))
     conn.commit()
     conn.close()
 
@@ -196,21 +212,11 @@ async def search_filings(
     if not end:
         end = date.today().isoformat()
 
-    # Check cache first
-    if not refresh:
-        cached = get_cached(start, end)
-        if cached:
-            for r in cached:
-                r.pop('cached_at', None)
-                r.pop('adsh', None)
-            log.info(f"Cache hit: {len(cached)} records for {start} to {end}")
-            return JSONResponse({'results': cached, 'partial': False, 'processed': 0, 'total_filings': 0})
-
-    # Cache miss — search EDGAR
     import time as _time
-    deadline = _time.time() + 240  # 4 minute max to stay under Railway timeout
+    deadline = _time.time() + 240  # 4 minute max
 
-    log.info(f"Cache miss — scraping EDGAR for {start} to {end}")
+    # Always query EDGAR for the filing list (fast — single API call)
+    log.info(f"Querying EDGAR for {start} to {end}")
     params = {
         'forms': 'SC TO-T',
         'dateRange': 'custom',
@@ -227,16 +233,32 @@ async def search_filings(
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=502)
 
-    log.info(f"EDGAR returned {len(hits)} filings to process")
+    log.info(f"EDGAR returned {len(hits)} filings")
 
-    # Fetch each filing and extract attorneys (with time guard)
-    results = []
+    # Check which filings have already been processed
+    cached_adsh = set()
+    if not refresh:
+        conn = sqlite3.connect(str(DB_PATH))
+        rows = conn.execute("SELECT adsh FROM processed_filings").fetchall()
+        cached_adsh = {r[0] for r in rows}
+        conn.close()
+
+    # Get cached results for this date range
+    cached_results = get_cached(start, end) if not refresh else []
+    for r in cached_results:
+        r.pop('cached_at', None)
+        r.pop('adsh', None)
+
+    # Only fetch HTML for filings NOT in cache
+    new_results = []
     seen_adsh = set()
-    processed = 0
+    fetched = 0
+    skipped_cached = 0
     timed_out = False
+
     for h in hits:
         if _time.time() > deadline:
-            log.warning(f"Time limit reached after {processed} filings — returning partial results")
+            log.warning(f"Time limit reached after {fetched} fetches — returning partial results")
             timed_out = True
             break
 
@@ -253,10 +275,15 @@ async def search_filings(
             continue
         seen_adsh.add(adsh)
 
+        # Skip if already cached
+        if adsh in cached_adsh and not refresh:
+            skipped_cached += 1
+            continue
+
         if not ciks or not filename:
             continue
 
-        processed += 1
+        fetched += 1
         url = build_filing_url(adsh, ciks[0], filename)
         html = None
         try:
@@ -279,9 +306,15 @@ async def search_filings(
             clean_companies.append(name)
 
         for a in attorneys:
+            # Skip garbage entries
             if not a['firm'] and (not a['attorney_names'] or '___' in a['attorney_names']):
                 continue
-            results.append({
+            # Skip mis-parsed prose (not a real firm/attorney)
+            if a['firm'] and len(a['firm']) > 80:
+                continue
+            if a['firm'] and any(w in a['firm'].lower() for w in ['amendment', 'lawsuits', 'pursuant', 'filed by', 'statement']):
+                continue
+            new_results.append({
                 'adsh': adsh,
                 'filing_date': file_date,
                 'form': form,
@@ -293,17 +326,22 @@ async def search_filings(
                 'filing_url': url,
             })
 
-    log.info(f"Processed {processed} filings, extracted {len(results)} attorney records")
+    # Save new results to cache + mark all fetched filings as processed
+    if new_results:
+        save_to_cache(new_results)
+    mark_processed(list(seen_adsh - cached_adsh))
 
-    # Save to cache
-    save_to_cache(results)
-    log.info(f"Cached {len(results)} records")
+    log.info(f"Cached: {skipped_cached} filings, Fetched: {fetched} new, Extracted: {len(new_results)} attorney records")
 
-    # Strip internal fields for response
-    for r in results:
+    # Merge cached + new, strip internal fields
+    for r in new_results:
         r.pop('adsh', None)
+    all_results = cached_results + new_results
+    # Sort by date descending
+    all_results.sort(key=lambda x: x.get('filing_date', ''), reverse=True)
 
-    resp_data = {'results': results, 'partial': timed_out, 'processed': processed, 'total_filings': len(hits)}
+    total_filings = len(seen_adsh)
+    resp_data = {'results': all_results, 'partial': timed_out, 'processed': fetched, 'total_filings': total_filings}
     return JSONResponse(resp_data)
 
 
