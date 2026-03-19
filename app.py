@@ -215,23 +215,36 @@ async def search_filings(
     import time as _time
     deadline = _time.time() + 240  # 4 minute max
 
-    # Always query EDGAR for the filing list (fast — single API call)
+    # Query EDGAR for the filing list — paginate to get ALL results
     log.info(f"Querying EDGAR for {start} to {end}")
-    params = {
-        'forms': 'SC TO-T',
-        'dateRange': 'custom',
-        'startdt': start,
-        'enddt': end,
-        '_source': 'adsh,form,file_date,display_names,ciks,biz_locations',
-        'size': 400,
-    }
-    try:
-        r = requests.get(EDGAR_SEARCH, params=params,
-                         headers={'User-Agent': USER_AGENT}, timeout=30)
-        r.raise_for_status()
-        hits = r.json().get('hits', {}).get('hits', [])
-    except Exception as e:
-        return JSONResponse({'error': str(e)}, status_code=502)
+    hits = []
+    page_from = 0
+    page_size = 200
+    while True:
+        params = {
+            'forms': 'SC TO-T',
+            'dateRange': 'custom',
+            'startdt': start,
+            'enddt': end,
+            '_source': 'adsh,form,file_date,display_names,ciks,biz_locations',
+            'size': page_size,
+            'from': page_from,
+        }
+        try:
+            r = requests.get(EDGAR_SEARCH, params=params,
+                             headers={'User-Agent': USER_AGENT}, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            page_hits = data.get('hits', {}).get('hits', [])
+            total = data.get('hits', {}).get('total', {}).get('value', 0)
+            hits.extend(page_hits)
+            if len(hits) >= total or not page_hits:
+                break
+            page_from += page_size
+        except Exception as e:
+            if not hits:
+                return JSONResponse({'error': str(e)}, status_code=502)
+            break
 
     log.info(f"EDGAR returned {len(hits)} filings")
 
